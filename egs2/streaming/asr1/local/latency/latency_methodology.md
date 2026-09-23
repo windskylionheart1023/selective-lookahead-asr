@@ -114,8 +114,12 @@ Token-exact (`max_t(chunk_t + depth_t)`):
 
 ## 5. Scripts
 
-- **`research_docs/latency/per_word_latency_exact.py` — CANONICAL.** Token-exact `max_t(chunk_t + depth_t)`: per-token chunks from the nrc0 dump mapped onto the P3 token ladder (`…/1best_recog/token`, nrc0–4), per-token settle depth from token-level firstdiff, aggregated to words by max. Computes both metrics, all thresholds.
-- `research_docs/latency/per_word_latency_waitpolicy.py` — word-level approximation (uses the word's last-token chunk + word settle depth); ~4–9 ms off for straddling words. Also prints the intermediate per-chunk version.
-- `research_docs/latency/base_lag_vs_gt.py` — the ~228 ms nrc0 base lag vs MFA.
-- `research_docs/latency/per_word_latency.py`, `per_word_latency_prefix.py` — earlier as-is / per-chunk variants (superseded).
-- Mechanism verification (whole-chunk rollback): batch_beam_search.py:997, asr_inference_streaming_modified.py:2013/2356. See memory `project_branchd_commit_stable_prefix_latency`.
+- `compute_emission_latency.py`: per-word emission latency from a decode's 1-best `latency` file against `ref_word_endtimes_testfull.json` (Table V static rows).
+- `compute_emission_latency_csp.py`: the same for dynamic decodes, pooled over all shards; prints `dep` (whole-chunk, the rollback rows) and `prc` (stable prefix) (Table V dynamic rows).
+- `analyze_csp_shards.py` with `per_word_latency_real.py`: trace-based variant against the public LibriSpeech alignments (`LIBRISPEECH_ALIGNMENTS`); gives lower absolute values.
+
+## 6. Values printed in the paper
+
+Some printed latencies (mean/median/p90, ms) differ from what these scripts give; no conclusion changes.
+- Table V static rows were read from the 3rd-best hypothesis. With the 1-best: R=0 233/234/686, R=1 816/862/1290, R=4 2483/2908/3508 (printed 240/238/696, 813/860/1298, 2490/2910/3518). The static cells of Tables IV and VI and the points of Fig. 5 shift by at most 16 ms for the same reason.
+- Table V Random and Oracle rows were measured with `analyze_csp_shards.py`. With `compute_emission_latency_csp.py`, like the other dynamic rows: Random 1505/1294/3244 (printed 1410/1078/3248), Oracle 706/316/3050 (printed 696/292/3072).

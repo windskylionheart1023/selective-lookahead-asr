@@ -15,8 +15,8 @@ WER (6.5%) at a median per-word latency of 306 ms versus 860 ms for one-chunk st
 
 This is a fork of [ESPnet](https://github.com/espnet/espnet) (base commit
 [`412aa11`](https://github.com/espnet/espnet/tree/412aa11f77ceeee405f75ee21aa5b33cad438fba)).
-The first commit holds the unmodified upstream files and the second every change for
-the paper. Everything specific to the paper lives in:
+The first commit holds the unmodified upstream files; the later commits hold every change
+for the paper. Everything specific to the paper lives in:
 
 | Path | Contents |
 | --- | --- |

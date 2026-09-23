@@ -116,12 +116,12 @@ lookaheads: `local/triggers/build_wait_policy_dataset.py` then
 ## Latency
 
 `local/latency/` measures per-word emission latency against Montreal Forced Aligner
-word ends (public LibriSpeech alignments; set `LIBRISPEECH_ALIGNMENTS`):
-`analyze_csp_shards.py` pools sharded decodes and reports WER plus mean/median/p90 for
-the whole-chunk (`dep`) and per-token (`prc`) conventions (for `chunk_rollback`
-decodes report `dep`: the per-token parser would date tokens too early);
-`latency_methodology.md` explains the metric. Keep the decoder's trace logging on
-(default).
+word ends. Table V: `compute_emission_latency.py` (static rows) and
+`compute_emission_latency_csp.py` (dynamic rows, all shards: `dep` = rollback, `prc` =
+stable prefix), on the test-clean reference `ref_word_endtimes_testfull.json`;
+`analyze_csp_shards.py` is a trace-based variant on the public alignments
+(`LIBRISPEECH_ALIGNMENTS`). `latency_methodology.md` explains the metric and lists
+printed values that differ from these scripts. Keep the decoder's trace logging on (default).
 
 On shared storage that drops out, `--stage_data_to_scratch true` (in `run.sh` or
 `asr_streaming_sim.sh`) copies model, config and audio to node-local scratch first.

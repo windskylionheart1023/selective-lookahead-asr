@@ -8,7 +8,6 @@ Usage: CHUNK_MS=768 python analyze_csp_shards.py <shard_dir1> <shard_dir2> ...
   or its parent (globs find score_wer/ and logdir/ underneath).
 """
 import sys, glob, os, statistics as st
-sys.path.insert(0, "research_docs/latency")
 import per_word_latency_real as P
 P.CHUNK_MS = float(os.environ.get("CHUNK_MS", 768))
 
