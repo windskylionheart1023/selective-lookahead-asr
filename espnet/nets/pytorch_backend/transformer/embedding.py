@@ -82,17 +82,21 @@ class PositionalEncoding(torch.nn.Module):
         pe = pe.unsqueeze(0)
         self.pe = pe.to(device=x.device, dtype=x.dtype)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, t_offset: int = 0):
         """Add positional encoding.
 
         Args:
             x (torch.Tensor): Input tensor (batch, time, `*`).
+            t_offset (int): Start position offset into the positional table,
+                used for incremental (KV-cached) decoding where x contains
+                only the newest frames. Default 0 reproduces the original
+                behavior.
 
         Returns:
             torch.Tensor: Encoded tensor (batch, time, `*`).
         """
         self.extend_pe(x)
-        x = x * self.xscale + self.pe[:, : x.size(1)]
+        x = x * self.xscale + self.pe[:, t_offset : t_offset + x.size(1)]
         return self.dropout(x)
 
 
@@ -506,3 +510,37 @@ class ConvolutionalPositionalEmbedding(torch.nn.Module):
         if self.use_residual:
             x = x + residual
         return x
+
+
+class NoPositionalEncoding(torch.nn.Module):
+    """Positional encoding stub that adds no positional information.
+
+    Applies only the standard input scaling (x * sqrt(d_model)) and dropout.
+    Used when RoPE is selected, since RoPE is applied inside the attention
+    modules.
+    """
+
+    def __init__(self, d_model: int, dropout_rate: float = 0.0, *args, **kwargs):
+        """Construct a NoPositionalEncoding object.
+
+        Args:
+            d_model (int): Embedding dimension, used for input scaling.
+            dropout_rate (float): Dropout rate.
+        """
+        super(NoPositionalEncoding, self).__init__()
+        self.d_model = d_model
+        self.xscale = math.sqrt(d_model) if d_model > 0 else 1.0
+        self.dropout = torch.nn.Dropout(p=dropout_rate)
+
+    def forward(self, x: torch.Tensor, t_offset: int = 0) -> torch.Tensor:
+        """Scale the input and apply dropout without positional encoding.
+
+        Args:
+            x (torch.Tensor): Input tensor (batch, time, `*`).
+            t_offset (int): Unused, kept for API compatibility with
+                PositionalEncoding.
+
+        Returns:
+            torch.Tensor: Scaled tensor (batch, time, `*`).
+        """
+        return self.dropout(x * self.xscale)

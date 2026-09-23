@@ -3,7 +3,7 @@
 
 """Decoder definition."""
 import logging
-from typing import Any, List, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 from typeguard import typechecked
@@ -51,6 +51,8 @@ class BaseTransformerDecoder(
             i.e. x -> x + linear(concat(x, att(x)))
             if False, no additional linear will be applied.
             i.e. x -> x + att(x)
+        use_rope: whether to use RoPE in the decoder self-attention; when True,
+            the absolute positional encoding on the embedding is removed.
     """
 
     @typechecked
@@ -65,23 +67,36 @@ class BaseTransformerDecoder(
         pos_enc_class=PositionalEncoding,
         normalize_before: bool = True,
         gradient_checkpoint_layers: List[int] = [],
+        use_rope: bool = False, # RoPE is only applied for the self-attention
     ):
         super().__init__()
         attention_dim = encoder_output_size
 
         if input_layer == "embed":
-            self.embed = torch.nn.Sequential(
-                torch.nn.Embedding(vocab_size, attention_dim),
-                pos_enc_class(attention_dim, positional_dropout_rate),
-            )
+            if use_rope:
+                # remove the abs positional encoding when using RoPE
+                self.embed = torch.nn.Embedding(vocab_size, attention_dim)
+            else:
+                self.embed = torch.nn.Sequential(
+                    torch.nn.Embedding(vocab_size, attention_dim),
+                    pos_enc_class(attention_dim, positional_dropout_rate),
+                )
         elif input_layer == "linear":
-            self.embed = torch.nn.Sequential(
-                torch.nn.Linear(vocab_size, attention_dim),
-                torch.nn.LayerNorm(attention_dim),
-                torch.nn.Dropout(dropout_rate),
-                torch.nn.ReLU(),
-                pos_enc_class(attention_dim, positional_dropout_rate),
-            )
+            if use_rope:
+                self.embed = torch.nn.Sequential(
+                    torch.nn.Linear(vocab_size, attention_dim),
+                    torch.nn.LayerNorm(attention_dim),
+                    torch.nn.Dropout(dropout_rate),
+                    torch.nn.ReLU(),
+                )
+            else:
+                self.embed = torch.nn.Sequential(
+                    torch.nn.Linear(vocab_size, attention_dim),
+                    torch.nn.LayerNorm(attention_dim),
+                    torch.nn.Dropout(dropout_rate),
+                    torch.nn.ReLU(),
+                    pos_enc_class(attention_dim, positional_dropout_rate),
+                )
         else:
             raise ValueError(f"only 'embed' or 'linear' is supported: {input_layer}")
 
@@ -102,12 +117,48 @@ class BaseTransformerDecoder(
         self.gradient_checkpoint_layers = gradient_checkpoint_layers
         logging.info(f"Gradient checkpoint layers: {self.gradient_checkpoint_layers}")
 
+    def _clear_kvcache(self):
+        """Clear key-value cache used for inference-time attention.
+
+        This method deletes the stored key and value tensors along with their
+        associated length tracking variables. It is typically used to reset
+        the internal state before starting a new sequence or utterance.
+        """
+        for decoder in self.decoders:
+            decoder._clear_kvcache()
+
+    def _extend_cross_kvcache(self, new_memory, max_cache_frames: int = -1):
+        """Extend cross-attention KV cache with new encoder frames.
+
+        Args:
+            new_memory: New encoder frames (B, T_new, D).
+            max_cache_frames: Max frames to keep (-1 = unlimited).
+        """
+        for decoder in self.decoders:
+            decoder._extend_cross_kvcache(new_memory, max_cache_frames=max_cache_frames)
+
+    def _update_hyp_order(self, order):
+        """Reorder cached key-value pairs according to new hypothesis order.
+
+        This is used in beam search decoding where hypotheses are reordered
+        after pruning or scoring. The internal key and value caches are
+        updated to reflect the new beam order.
+
+        Args:
+            order (torch.LongTensor): A tensor of shape (B,) containing the new
+                indices for each hypothesis in the beam. This is used to permute
+                the current cache tensors accordingly.
+        """
+        for decoder in self.decoders:
+            decoder._update_hyp_order(order)
+
     def forward(
         self,
         hs_pad: torch.Tensor,
         hlens: torch.Tensor,
         ys_in_pad: torch.Tensor,
         ys_in_lens: torch.Tensor,
+        cross_attn_mask: Optional[torch.Tensor] = None,
         return_hs: bool = False,
         return_all_hs: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -121,6 +172,10 @@ class BaseTransformerDecoder(
                 if input_layer == "embed"
                 input tensor (batch, maxlen_out, #mels) in the other cases
             ys_in_lens: (batch)
+            cross_attn_mask: optional causal cross-attention mask, bool
+                (batch, maxlen_out, maxlen_in) where True = valid, False = masked.
+                If provided, each decoder position can only attend to encoder
+                positions where the mask is True.
             return_hs: (bool) whether to return the last hidden output
                                   before output layer
             return_all_hs: (bool) whether to return all the hidden intermediates
@@ -140,6 +195,7 @@ class BaseTransformerDecoder(
         tgt_mask = tgt_mask & m
 
         memory = hs_pad
+        # Create padding mask: (B, 1, src_len)
         memory_mask = (~make_pad_mask(hlens, maxlen=memory.size(1)))[:, None, :].to(
             memory.device
         )
@@ -150,9 +206,18 @@ class BaseTransformerDecoder(
                 memory_mask, (0, padlen), "constant", False
             )
 
+        # Combine with causal cross-attention mask if provided
+        if cross_attn_mask is not None:
+            # cross_attn_mask: (B, tgt_len, src_len) - True = valid
+            # memory_mask: (B, 1, src_len) - True = valid
+            # Result: (B, tgt_len, src_len) - both conditions must be True
+            memory_mask = memory_mask & cross_attn_mask
+
         x = self.embed(tgt)
         intermediate_outs = []
         for layer_idx, decoder_layer in enumerate(self.decoders):
+            # set the validation mode for decoder layers
+            decoder_layer.validation_mode = getattr(self, "validation_mode", False)
             if layer_idx + 1 in self.gradient_checkpoint_layers:
                 x, tgt_mask, memory, memory_mask = torch.utils.checkpoint.checkpoint(
                     decoder_layer, x, tgt_mask, memory, memory_mask, use_reentrant=False
@@ -186,6 +251,8 @@ class BaseTransformerDecoder(
         *,
         cache: List[torch.Tensor] = None,
         return_hs: bool = False,
+        new_encoder_frames: torch.Tensor = None,
+        cross_attn_max_cache_frames: int = -1,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """Forward one step.
 
@@ -199,19 +266,79 @@ class BaseTransformerDecoder(
             cache: cached output list of (batch, max_time_out-1, size)
             return_hs: dec hidden state corresponding to ys,
                 used for searchable hidden ints
+            new_encoder_frames: optional new encoder frames (batch, T_new, feat)
+                for incremental cross-attention KV cache extension in streaming.
+            cross_attn_max_cache_frames: sliding window size for cross-attn
+                KV cache. -1 means unlimited.
         Returns:
             y, cache: NN output value and cache per `self.decoders`.
             y.shape` is (batch, maxlen_out, token)
         """
-        x = self.embed(tgt)
+        use_kvcache = getattr(self, "use_kvcache", False)
+        _kv_kwargs = {"use_kvcache": use_kvcache}
+
+        # Extend cross-attention KV cache with new encoder frames (streaming)
+        if new_encoder_frames is not None and use_kvcache:
+            self._extend_cross_kvcache(
+                new_encoder_frames, max_cache_frames=cross_attn_max_cache_frames
+            )
+
+        if use_kvcache and cache is not None:
+            # Note: The first iteration must skip this path (in order to process
+            #       the entire prompt). This is done with the "cache is not None"
+            #       condition above.
+            if isinstance(self.embed, torch.nn.Embedding):
+                # RoPE case: bare Embedding, no positional encoding layer.
+                # Positions are handled by RoPE inside the attention modules.
+                x = self.embed(tgt[:, -1:])  # (B, 1, D)
+            else:
+                assert (
+                    len(self.embed) == 2
+                ), "kvcache: currently only supporting Embedding + pos_encoding"
+                assert isinstance(
+                    self.embed[0], torch.nn.Embedding
+                ), "kvcache: self.embed[0] must be Embedding"
+                assert isinstance(
+                    self.embed[1], PositionalEncoding
+                ), "kvcache: self.embed[1] must be PositionalEncoding"
+                x = self.embed[0](tgt[:, -1:])  # (B, 1, D)
+                x = self.embed[1](x, t_offset=tgt.size(1) - 1)  # (B, 1, D)
+            if tgt_mask is not None:
+                tgt_mask = tgt_mask[:, -1:]  # (B, 1, Tk)
+        else:
+            x = self.embed(tgt)
+            if use_kvcache:
+                # Full reprocessing path: clear stale attention KV caches so they
+                # get reinitialized from scratch (k_cache is None → init path).
+                self._clear_kvcache()
+
         if cache is None:
             cache = [None] * len(self.decoders)
+
+        # When using incremental decoding (cache-based or KV cache),
+        # the decoder layer processes only the last query frame.
+        # Slice memory_mask to match that query size so cross-attention
+        # broadcasting does not inflate the output shape.
+        if (
+            cache[0] is not None
+            and memory_mask is not None
+            and memory_mask.dim() == 3
+            and memory_mask.shape[1] > 1
+        ):
+            memory_mask = memory_mask[:, -1:, :]
+
         new_cache = []
         for c, decoder in zip(cache, self.decoders):
             x, tgt_mask, memory, memory_mask = decoder(
-                x, tgt_mask, memory, memory_mask, cache=c
+                x, tgt_mask, memory, memory_mask, cache=c, **_kv_kwargs
             )
-            new_cache.append(x)
+            if use_kvcache:
+                dummy_state = torch.zeros(
+                    (tgt.size(0),), dtype=torch.bool, device="cpu"
+                )
+                new_cache.append(dummy_state)  # dummy variable that's not None
+            else:
+                new_cache.append(x)  # x = cat(previous cache, new state vector)
 
         if self.normalize_before:
             y = self.after_norm(x[:, -1])
@@ -254,6 +381,9 @@ class BaseTransformerDecoder(
         states: List[Any],
         xs: torch.Tensor,
         return_hs: bool = False,
+        new_encoder_frames: torch.Tensor = None,
+        memory_mask: torch.Tensor = None,
+        cross_attn_max_cache_frames: int = -1,
     ) -> Tuple[torch.Tensor, List[Any]]:
         """Score new token batch.
 
@@ -262,7 +392,12 @@ class BaseTransformerDecoder(
             states (List[Any]): Scorer states for prefix tokens.
             xs (torch.Tensor):
                 The encoder feature that generates ys (n_batch, xlen, n_feat).
-
+            new_encoder_frames: optional new encoder frames (batch, T_new, feat)
+                for incremental cross-attention KV cache extension in streaming.
+            memory_mask: optional cross-attention mask (n_batch, ylen, xlen)
+                where True=allow. Used for chunked streaming inference.
+            cross_attn_max_cache_frames: sliding window size for cross-attn
+                KV cache. -1 means unlimited.
 
         Returns:
             tuple[torch.Tensor, List[Any]]: Tuple of
@@ -273,7 +408,7 @@ class BaseTransformerDecoder(
         # merge states
         n_batch = len(ys)
         n_layers = len(self.decoders)
-        if states[0] is None:
+        if any(s is None for s in states):
             batch_state = None
         else:
             # transpose state of [batch, layer] into [layer, batch]
@@ -286,11 +421,17 @@ class BaseTransformerDecoder(
         ys_mask = subsequent_mask(ys.size(-1), device=xs.device).unsqueeze(0)
         if return_hs:
             (logp, hs), states = self.forward_one_step(
-                ys, ys_mask, xs, cache=batch_state, return_hs=return_hs
+                ys, ys_mask, xs, memory_mask=memory_mask,
+                cache=batch_state, return_hs=return_hs,
+                new_encoder_frames=new_encoder_frames,
+                cross_attn_max_cache_frames=cross_attn_max_cache_frames,
             )
         else:
             logp, states = self.forward_one_step(
-                ys, ys_mask, xs, cache=batch_state, return_hs=return_hs
+                ys, ys_mask, xs, memory_mask=memory_mask,
+                cache=batch_state, return_hs=return_hs,
+                new_encoder_frames=new_encoder_frames,
+                cross_attn_max_cache_frames=cross_attn_max_cache_frames,
             )
 
         # transpose state of [layer, batch] into [batch, layer]
@@ -380,6 +521,19 @@ class BaseTransformerDecoder(
 
 
 class TransformerDecoder(BaseTransformerDecoder):
+    """Transformer decoder with optional KV caching and RoPE.
+
+    In addition to the standard arguments of BaseTransformerDecoder:
+
+    Args:
+        use_kvcache: whether to enable key-value caching in the attention
+            modules for incremental (streaming) decoding.
+        kvcache_maxlen: maximum number of cached key-value positions.
+        use_rope: whether to use RoPE in the decoder self-attention
+            (cross-attention never uses RoPE); when True, the absolute
+            positional encoding on the embedding is removed.
+    """
+
     @typechecked
     def __init__(
         self,
@@ -400,6 +554,9 @@ class TransformerDecoder(BaseTransformerDecoder):
         layer_drop_rate: float = 0.0,
         qk_norm: bool = False,
         use_flash_attn: bool = True,
+        use_kvcache: bool = False,
+        kvcache_maxlen: int = 8192,
+        use_rope: bool = False, # RoPE is only applied for the self-attention
         gradient_checkpoint_layers: List[int] = [],
     ):
         super().__init__(
@@ -412,6 +569,7 @@ class TransformerDecoder(BaseTransformerDecoder):
             pos_enc_class=pos_enc_class,
             normalize_before=normalize_before,
             gradient_checkpoint_layers=gradient_checkpoint_layers,
+            use_rope=use_rope,
         )
 
         if use_flash_attn:
@@ -424,12 +582,16 @@ class TransformerDecoder(BaseTransformerDecoder):
                 import flash_attn  # noqa
             except Exception:
                 use_flash_attn = False
+        self.use_kvcache = use_kvcache
+        self.kvcache_maxlen = kvcache_maxlen
+        self.use_rope = use_rope
 
         attention_dim = encoder_output_size
         self.decoders = repeat(
             num_blocks,
             lambda lnum: DecoderLayer(
                 attention_dim,
+                # Self attention
                 MultiHeadedAttention(
                     attention_heads,
                     attention_dim,
@@ -438,7 +600,11 @@ class TransformerDecoder(BaseTransformerDecoder):
                     use_flash_attn,
                     True,
                     False,
+                    use_kvcache=use_kvcache,
+                    kvcache_maxlen=kvcache_maxlen,
+                    use_rope=use_rope, # RoPE in self attention
                 ),
+                # Cross attention
                 MultiHeadedAttention(
                     attention_heads,
                     attention_dim,
@@ -447,6 +613,9 @@ class TransformerDecoder(BaseTransformerDecoder):
                     use_flash_attn,
                     False,
                     True,
+                    use_kvcache=use_kvcache,
+                    kvcache_maxlen=kvcache_maxlen,
+                    use_rope=False, # RoPE is not used for cross attention
                 ),
                 PositionwiseFeedForward(attention_dim, linear_units, dropout_rate),
                 dropout_rate,

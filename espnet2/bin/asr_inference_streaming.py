@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import logging
 import math
 import sys
@@ -346,6 +347,10 @@ class Speech2TextStreaming:
             # remove blank symbol id, which is assumed to be 0
             token_int = list(filter(lambda x: x != 0, token_int))
 
+            # remove last scores_list entry (corresponds to EOS)
+            if hyp.scores_list:
+                hyp.scores_list.pop()
+
             # Change integer-ids to tokens
             token = self.converter.ids2tokens(token_int)
 
@@ -449,6 +454,7 @@ def inference(
 
     # 7 .Start for-loop
     # FIXME(kamo): The output format should be discussed about
+    scores_list_data = {n: [] for n in range(1, nbest + 1)}
     with DatadirWriter(output_dir) as writer:
         for keys, batch in loader:
             assert isinstance(batch, dict), type(batch)
@@ -490,8 +496,42 @@ def inference(
                 ibest_writer["token_int"][key] = " ".join(map(str, token_int))
                 ibest_writer["score"][key] = str(hyp.score)
 
+                # Per-token encoder block index (latency monitoring).
+                # ChunkEmissionIndex is populated by BatchBeamSearchOnline
+                # at every token-append site. It indexes emitted tokens
+                # excluding SOS, so cei[i] aligns with yseq[i+1]. To match
+                # token_int (= yseq[1:-1] post-blank-filter) we slice off
+                # the trailing EOS-slot if present and apply the same
+                # blank-filter. Skipped silently when unavailable, so this
+                # is fully backward-compatible.
+                if (
+                    hasattr(hyp, "ChunkEmissionIndex")
+                    and hyp.ChunkEmissionIndex.numel() > 0
+                ):
+                    raw_ids = (
+                        hyp.yseq[1:-1].tolist()
+                        if hasattr(hyp.yseq, "tolist")
+                        else list(hyp.yseq[1:-1])
+                    )
+                    cei = hyp.ChunkEmissionIndex.tolist()
+                    cei = cei[: len(raw_ids)]
+                    filtered_block_idx = [
+                        int(cei[i]) for i, t in enumerate(raw_ids) if t != 0
+                    ]
+                    ibest_writer["block_idx"][key] = " ".join(
+                        map(str, filtered_block_idx)
+                    )
+
                 if text is not None:
                     ibest_writer["text"][key] = text
+
+                scores_list_data[n].append((key, hyp.scores_list))
+
+    # Write scores_list.json for each n-best
+    for n in range(1, nbest + 1):
+        score_file_path = f"{output_dir}/{n}best_recog/scores_list.json"
+        with open(score_file_path, "w") as f:
+            json.dump(scores_list_data[n], f)
 
 
 def get_parser():

@@ -52,7 +52,11 @@ def calculate_all_attentions(
             if isinstance(module, MultiHeadedAttention):
                 # NOTE(kamo): MultiHeadedAttention doesn't return attention weight
                 # attn: (B, Head, Tout, Tin)
-                outputs[name] = module.attn.detach().cpu()
+                # Fused attention paths (use_sdpa / flex) never materialize the
+                # attention matrix, so module.attn stays None; skip those
+                # modules instead of crashing the att_plot stage.
+                if module.attn is not None:
+                    outputs[name] = module.attn.detach().cpu()
             elif isinstance(module, AttLoc2D):
                 c, w = output
                 # w: previous concate attentions

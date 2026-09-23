@@ -30,6 +30,11 @@ class Hypothesis:
         torch.Tensor,
     ]
     lm_state: Union[Dict[str, Any], List[Any]] = None
+    # Per-token emission frame index, parallel to yseq (timestamp[i] is the
+    # encoder frame at which yseq[i] was emitted; -1 for the initial blank
+    # prefix). Recorded by greedy_search / default_beam_search for streaming
+    # latency evaluation. None for search types that do not record it.
+    timestamp: List[int] = None
 
 
 @dataclass
@@ -248,12 +253,14 @@ class BeamSearchTransducer:
         """
         dec_state = self.decoder.init_state(1)
 
-        hyp = Hypothesis(score=0.0, yseq=[self.blank_id], dec_state=dec_state)
+        hyp = Hypothesis(
+            score=0.0, yseq=[self.blank_id], dec_state=dec_state, timestamp=[-1]
+        )
         cache = {}
 
         dec_out, state, _ = self.decoder.score(hyp, cache)
 
-        for enc_out_t in enc_out:
+        for t, enc_out_t in enumerate(enc_out):
             logp = torch.log_softmax(
                 self.joint_network(enc_out_t, dec_out),
                 dim=-1,
@@ -262,6 +269,7 @@ class BeamSearchTransducer:
 
             if pred != self.blank_id:
                 hyp.yseq.append(int(pred))
+                hyp.timestamp.append(t)
                 hyp.score += float(top_logp)
 
                 hyp.dec_state = state
@@ -287,11 +295,15 @@ class BeamSearchTransducer:
 
         dec_state = self.decoder.init_state(1)
 
-        kept_hyps = [Hypothesis(score=0.0, yseq=[self.blank_id], dec_state=dec_state)]
+        kept_hyps = [
+            Hypothesis(
+                score=0.0, yseq=[self.blank_id], dec_state=dec_state, timestamp=[-1]
+            )
+        ]
         cache = {}
         cache_lm = {}
 
-        for enc_out_t in enc_out:
+        for t, enc_out_t in enumerate(enc_out):
             hyps = kept_hyps
             kept_hyps = []
 
@@ -329,6 +341,7 @@ class BeamSearchTransducer:
                         yseq=max_hyp.yseq[:],
                         dec_state=max_hyp.dec_state,
                         lm_state=max_hyp.lm_state,
+                        timestamp=max_hyp.timestamp[:],  # blank: no new token
                     )
                 )
 
@@ -361,6 +374,7 @@ class BeamSearchTransducer:
                             yseq=max_hyp.yseq[:] + [int(k + 1)],
                             dec_state=state,
                             lm_state=lm_state,
+                            timestamp=max_hyp.timestamp[:] + [t],  # emit at frame t
                         )
                     )
 

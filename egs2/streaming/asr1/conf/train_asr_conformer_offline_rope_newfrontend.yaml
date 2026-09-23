@@ -1,0 +1,87 @@
+# network architecture
+
+# frontend related
+frontend: default
+frontend_conf:
+    n_fft: 512
+    win_length: 512  # 32ms window
+    hop_length: 128  # 8ms stride
+    center: false
+
+# encoder related
+encoder: conformer
+encoder_conf:
+    input_layer: conv2d6_wo_posenc
+    num_blocks: 12
+    linear_units: 2048
+    dropout_rate: 0.1
+    output_size: 256
+    attention_heads: 4
+    attention_dropout_rate: 0.0
+    pos_enc_layer_type: rope
+    selfattention_layer_type: selfattn
+    activation_type: swish
+    macaron_style: true
+    use_cnn_module: true
+    cnn_module_kernel: 15
+    use_kvcache: false
+    use_rope: true
+    use_flash_attn: false
+
+# decoder related
+decoder: transformer
+decoder_conf:
+    input_layer: embed
+    num_blocks: 6
+    linear_units: 2048
+    dropout_rate: 0.1
+    use_kvcache: false
+    use_rope: false
+    use_flash_attn: false
+
+# hybrid CTC/attention
+model_conf:
+    ctc_weight: 0.3
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    dynamic_chunk_training: false
+    use_chunked_cross_attn: false
+    use_alignment_loss: false
+
+# optimization related
+optim: adam
+batch_size: 32
+accum_grad: 2
+grad_clip: 3
+max_epoch: 40
+optim_conf:
+    lr: 4.0
+scheduler: noamlr
+scheduler_conf:
+    model_size: 256
+    warmup_steps: 25000
+
+best_model_criterion:
+-   - valid
+    - acc
+    - max
+keep_nbest_models: 10
+
+num_workers: 0
+
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 30
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range:
+    - 0
+    - 40
+    num_time_mask: 2
+

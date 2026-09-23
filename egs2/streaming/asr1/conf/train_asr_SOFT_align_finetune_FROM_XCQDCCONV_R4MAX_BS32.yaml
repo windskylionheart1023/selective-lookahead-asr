@@ -1,0 +1,124 @@
+# Chunk training with RoPE + dynamic right context — fine-tune from pretrained model
+# Encoder: asymmetric C-axis mask with dynamic right context (up to 4 chunks)
+# Decoder cross-attention: same left context as encoder, but NO right context
+# Decoder self-attention: follows encoder chunk config
+# NOTE: token_frame_mapping must be provided in training data for the causal mask
+#
+# SOFT-constraint cross-attn fine-tune — XCQDCCONV variant (R_max=4, BS=8)
+# Forked from train_asr_SOFT_align_finetune_FROM_SYNCDCCONV_R4MAX_BS8.yaml (2026-06-06)
+# with the following XCQ-DCConv changes:
+#   * encoder_conf.dcconv_sync_lookahead: true -> false
+#   * encoder_conf.dcconv_cross_c_q: <unset> -> true
+#     (depth-independent RF, asymm self-attn mask's "[i+k-R, i+k]" bound extended to DCConv)
+#   * SOFT branch retains use_chunked_cross_attn=false + use_alignment_loss=true +
+#     early_emit_weight=0.1 (soft-deadline edges mirror encoder R per batch)
+# Training shape (from baseline):
+#   * batch_size 8, accum_grad 8 (effective batch 64)
+#   * 40-epoch from-init fine-tune, lr 0.4, warmup_steps 25000
+#   * init_param: transferred_init_rope_newfrontend.pth (offline RoPE init —
+#     NOT a SYNCDCCONV checkpoint; clean comparison vs SYNC/CAUSAL fromInit siblings).
+
+# frontend related
+frontend: default
+frontend_conf:
+    n_fft: 512
+    win_length: 512  # 32ms window
+    hop_length: 128  # 8ms stride
+    center: false
+
+# encoder related
+encoder: conformer
+encoder_conf:
+    input_layer: conv2d6_wo_posenc
+    num_blocks: 12
+    linear_units: 2048
+    dropout_rate: 0.1
+    output_size: 256
+    attention_heads: 4
+    attention_dropout_rate: 0.0
+    pos_enc_layer_type: rope
+    selfattention_layer_type: selfattn
+    activation_type: swish
+    macaron_style: true
+    use_cnn_module: true
+    cnn_module_kernel: 15
+    use_kvcache: false
+    use_rope: true
+    use_sdpa: true                     # fused mem-efficient attention (parity-checked vs classic path)
+    use_flash_attn: false
+    use_flex_attention: false          # explicit; default is False anyway
+    dcconv_sync_lookahead: false       # XCQDCCONV: SYNC off, cross-c_q chaining on instead
+    dcconv_cross_c_q: true             # XCQDCCONV: DCConv reads c_q=k-(j-i) of chunk j; depth-independent RF bound
+
+# decoder related
+decoder: transformer
+decoder_conf:
+    input_layer: embed
+    num_blocks: 6
+    linear_units: 2048
+    dropout_rate: 0.1
+    use_kvcache: false
+    use_rope: false
+    use_flash_attn: false
+
+# hybrid CTC/attention
+model_conf:
+    ctc_weight: 0.3
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    dynamic_chunk_training: true
+    dynamic_chunk_training_config:
+        dynamic_right_context: true
+        right_context_chunks_max: 4
+        right_context_prob: 0.5
+    use_chunked_cross_attn: false                  # no hard mask (cross-attn unmasked)
+    use_alignment_loss: true
+    early_emit_weight: 0.1
+    cross_attn_sync_with_encoder_chunk: false      # default
+    cross_attn_num_right_sync_with_encoder: true   # NEW — soft-deadline edges mirror encoder
+    cross_attn_num_right_train: 0
+
+# fine-tune init
+init_param:
+- exp/ready_for_fine_tune/transferred_init_rope_newfrontend.pth
+ignore_init_mismatch: true
+
+# optimization related
+optim: adam
+batch_size: 32
+accum_grad: 2
+grad_clip: 3
+max_epoch: 40
+patience: 5
+optim_conf:
+    lr: 0.4
+scheduler: noamlr
+scheduler_conf:
+    model_size: 256
+    warmup_steps: 25000
+
+best_model_criterion:
+-   - valid
+    - acc
+    - max
+keep_nbest_models: 10
+
+# Data loading / mixed precision (ROPEFIX_fromInit speedup knobs)
+num_workers: 4
+use_amp: true
+
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 30
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range:
+    - 0
+    - 40
+    num_time_mask: 2

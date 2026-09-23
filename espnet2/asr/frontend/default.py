@@ -37,6 +37,7 @@ class DefaultFrontend(AbsFrontend):
         htk: bool = False,
         frontend_conf: Optional[dict] = get_default_kwargs(Frontend),
         apply_stft: bool = True,
+        pad_zero_channels: int = 0,
     ):
         super().__init__()
         if isinstance(fs, str):
@@ -74,10 +75,13 @@ class DefaultFrontend(AbsFrontend):
             htk=htk,
         )
         self.n_mels = n_mels
+        # constant-zero extra channels (e.g. NeLF dummy-pitch dims to reuse an
+        # 83-dim-input checkpoint on 80-dim fbank)
+        self.pad_zero_channels = pad_zero_channels
         self.frontend_type = "default"
 
     def output_size(self) -> int:
-        return self.n_mels
+        return self.n_mels + self.pad_zero_channels
 
     def forward(
         self, input: torch.Tensor, input_lengths: torch.Tensor
@@ -113,6 +117,12 @@ class DefaultFrontend(AbsFrontend):
         # input_power: (Batch, [Channel,] Length, Freq)
         #       -> input_feats: (Batch, Length, Dim)
         input_feats, _ = self.logmel(input_power, feats_lens)
+
+        if self.pad_zero_channels > 0:
+            zeros = input_feats.new_zeros(
+                *input_feats.shape[:-1], self.pad_zero_channels
+            )
+            input_feats = torch.cat([input_feats, zeros], dim=-1)
 
         return input_feats, feats_lens
 

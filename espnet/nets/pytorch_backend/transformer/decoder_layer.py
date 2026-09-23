@@ -70,6 +70,47 @@ class DecoderLayer(nn.Module):
 
         self.tgt_ids = None
 
+    def _clear_kvcache(self):
+        """Clear key-value cache used for inference-time attention.
+
+        This method deletes the stored key and value tensors along with their
+        associated length tracking variables. It is typically used to reset
+        the internal state before starting a new sequence or utterance.
+        """
+        self.self_attn._clear_kvcache()
+        if self.src_attn is not None:
+            self.src_attn._clear_kvcache()
+
+    def _extend_cross_kvcache(
+        self, new_memory: "torch.Tensor", max_cache_frames: int = -1
+    ):
+        """Extend cross-attention KV cache with new encoder frames.
+
+        Args:
+            new_memory: New encoder frames (B, T_new, D).
+            max_cache_frames: Max frames to keep (-1 = unlimited).
+        """
+        if self.src_attn is not None:
+            self.src_attn._extend_cross_kvcache(
+                new_memory, max_cache_frames=max_cache_frames
+            )
+
+    def _update_hyp_order(self, order):
+        """Reorder cached key-value pairs according to new hypothesis order.
+
+        This is used in beam search decoding where hypotheses are reordered
+        after pruning or scoring. The internal key and value caches are
+        updated to reflect the new beam order.
+
+        Args:
+            order (torch.LongTensor): A tensor of shape (B,) containing the new
+                indices for each hypothesis in the beam. This is used to permute
+                the current cache tensors accordingly.
+        """
+        self.self_attn._update_hyp_order(order)
+        if self.src_attn is not None:
+            self.src_attn._update_hyp_order(order)
+
     def forward(
         self,
         tgt,
@@ -79,6 +120,7 @@ class DecoderLayer(nn.Module):
         cache=None,
         pre_memory=None,
         pre_memory_mask=None,
+        use_kvcache=False,
     ):
         """Compute decoded features.
 
@@ -91,6 +133,9 @@ class DecoderLayer(nn.Module):
                 Each tensor shape should be (#batch, maxlen_out - 1, size).
             pre_memory (torch.Tensor): Encoded memory (#batch, maxlen_in, size).
             pre_memory_mask (torch.Tensor): Encoded memory mask (#batch, maxlen_in).
+            use_kvcache (bool): If True, run single-step decoding using the KV
+                caches stored inside the attention modules; the legacy `cache`
+                concatenation is skipped.
 
         Returns:
             torch.Tensor: Output tensor(#batch, maxlen_out, size).
@@ -99,11 +144,24 @@ class DecoderLayer(nn.Module):
             torch.Tensor: Encoded memory mask (#batch, maxlen_in).
 
         """
+        # set the validation mode for self attn and cross attn
+        if hasattr(self, "validation_mode") and self.validation_mode:
+            self.self_attn.validation_mode = True
+            self.src_attn.validation_mode = True
+            # only set True here; attention modules default to False and
+            # inference never sets it
         residual = tgt
         if self.normalize_before:
             tgt = self.norm1(tgt)
 
         if cache is None:
+            tgt_q = tgt
+            tgt_q_mask = tgt_mask
+        elif use_kvcache:
+            # cache is empty (dummy "False" variable) since the KV cache
+            # is stored in each attention module
+            # tgt: (B, 1, D)
+            # tgt_mask: (B, 1, Tk)
             tgt_q = tgt
             tgt_q_mask = tgt_mask
         else:
@@ -171,7 +229,7 @@ class DecoderLayer(nn.Module):
         if not self.normalize_before:
             x = self.norm3(x)
 
-        if cache is not None:
+        if cache is not None and not use_kvcache:
             x = torch.cat([cache, x], dim=1)
 
         if pre_memory is not None:

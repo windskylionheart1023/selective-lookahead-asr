@@ -6,6 +6,7 @@ import logging
 import numbers
 import random
 import re
+import time
 import types  # noqa
 from abc import ABC, abstractmethod
 from typing import (
@@ -69,7 +70,26 @@ class AdapterForSoundScpReader(collections.abc.Mapping):
         return iter(self.loader)
 
     def __getitem__(self, key: str) -> np.ndarray:
-        retval = self.loader[key]
+        # audioslave NFS returns transiently corrupt reads (kaldiio parse
+        # errors on entries that are valid on re-read); retry with backoff
+        # before failing the whole training step.
+        for attempt in range(3):
+            try:
+                retval = self.loader[key]
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                import time
+
+                time.sleep(2.0 * (attempt + 1))
+                # drop any cached file handle so the read reopens the ark
+                close = getattr(self.loader, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
 
         if isinstance(retval, tuple):
             assert len(retval) == 2, len(retval)
@@ -573,27 +593,38 @@ class ESPnetDataset(AbsDataset):
             return uid, data
 
         data = {}
+        # Retry transient read failures (e.g. flaky NFS) a few times before
+        # giving up, so a single transient I/O error does not kill a long run.
+        n_read_retry = 5
         # 1. Load data from each loaders
         for name, loader in self.loader_dict.items():
-            try:
-                value = loader[uid]
-                if isinstance(value, (list)):
-                    value = np.array(value)
-                if not isinstance(
-                    value, (np.ndarray, torch.Tensor, str, numbers.Number, tuple)
-                ):
-                    raise TypeError(
-                        (
-                            "Must be ndarray, torch.Tensor, "
-                            "str,  Number or tuple: {}".format(type(value))
+            for _attempt in range(n_read_retry):
+                try:
+                    value = loader[uid]
+                    break
+                except Exception:
+                    path, _type = self.debug_info[name]
+                    if _attempt == n_read_retry - 1:
+                        logging.error(
+                            f"Error happened with path={path}, type={_type}, id={uid}"
                         )
+                        raise
+                    logging.warning(
+                        f"Retry {_attempt + 1}/{n_read_retry} after read error "
+                        f"with path={path}, type={_type}, id={uid}"
                     )
-            except Exception:
-                path, _type = self.debug_info[name]
-                logging.error(
-                    f"Error happened with path={path}, type={_type}, id={uid}"
+                    time.sleep(0.5 * 2**_attempt)
+            if isinstance(value, (list)):
+                value = np.array(value)
+            if not isinstance(
+                value, (np.ndarray, torch.Tensor, str, numbers.Number, tuple)
+            ):
+                raise TypeError(
+                    (
+                        "Must be ndarray, torch.Tensor, "
+                        "str,  Number or tuple: {}".format(type(value))
+                    )
                 )
-                raise
 
             # torch.Tensor is converted to ndarray
             if isinstance(value, torch.Tensor):

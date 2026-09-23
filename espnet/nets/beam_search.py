@@ -1,6 +1,7 @@
 """Beam search module."""
 
 import logging
+import os
 from itertools import chain
 from typing import Any, Dict, List, NamedTuple, Tuple, Union
 
@@ -13,7 +14,14 @@ logger = logging.getLogger(__name__)
 
 
 class Hypothesis(NamedTuple):
-    """Hypothesis data type."""
+    """Hypothesis data type.
+
+    In addition to the upstream fields, this fork adds streaming
+    bookkeeping fields: ``scores_list`` (per-step score dicts),
+    ``confidence_list`` (top-1 softmax per emitted token),
+    ``TokenAgeIndex`` (per-token age in chunks since emission) and
+    ``ChunkEmissionIndex`` (chunk index each token was emitted in).
+    """
 
     yseq: torch.Tensor
     score: Union[float, torch.Tensor] = 0
@@ -21,6 +29,13 @@ class Hypothesis(NamedTuple):
     states: Dict[str, Any] = dict()
     # dec hidden state corresponding to yseq, used for searchable hidden ints
     hs: List[torch.Tensor] = []
+    scores_list: List[Any] = []
+    # Softmax of top-1 at each emission step (aligned with yseq[1:])
+    confidence_list: List[float] = []
+    # Does not contain age of <sos> token
+    TokenAgeIndex: torch.Tensor = torch.tensor([], dtype=torch.int32)
+    # Track which chunk each token was emitted in (does not contain <sos> chunk)
+    ChunkEmissionIndex: torch.Tensor = torch.tensor([], dtype=torch.int32)
 
     def asdict(self) -> dict:
         """Convert data to JSON-friendly dict."""
@@ -373,6 +388,13 @@ class BeamSearch(torch.nn.Module):
                         ),
                         states=self.merge_states(states, part_states, part_j),
                         hs=new_hs,
+                        # append new token age encoding (0), when a new token is appended
+                        TokenAgeIndex=torch.cat(
+                            [
+                                hyp.TokenAgeIndex.to(x.device),
+                                torch.tensor([0], device=x.device, dtype=torch.int32),
+                            ]
+                        ),
                     )
                 )
 
@@ -405,6 +427,10 @@ class BeamSearch(torch.nn.Module):
                 Sequential attn computes attn first on pre_x then on x,
                 thereby attending to two sources in sequence.
 
+        Note:
+            The environment variable RESUME_ENDDETECT_M (default 3) overrides
+            the end_detect window M used when maxlenratio is 0.0.
+
         Returns:
             list[Hypothesis]: N-best decoding results
 
@@ -431,17 +457,41 @@ class BeamSearch(torch.nn.Module):
 
         # main loop of prefix search
         running_hyps = self.init_hyp(x if pre_x is None else pre_x)
+        # FIX: end_detect matches finished hyps by len(yseq) == i - m using
+        # the LOOP index i. When the beam is seeded with a primer (the
+        # last-chunk resume), the yseq length is offset from i by the primer
+        # length, so end_detect cannot see a finished hyp until i climbs to
+        # the full sequence length, wasting ~primer_len steps. Offset i by
+        # the primer length so they align. No-op for a plain offline decode
+        # (primer = [sos], offset = 0).
+        _yseq = getattr(running_hyps, "yseq", None)
+        if _yseq is not None and _yseq.ndim == 2:
+            # BatchHypothesis: yseq is (n_beam, primer_len)
+            _ed_off = int(_yseq.shape[1]) - 1
+        else:
+            # plain List[Hypothesis] input has no yseq attribute: offset 0
+            _ed_off = 0
+        # RESUME_ENDDETECT_M overrides end_detect's window M (default 3):
+        # fewer = terminate sooner after a complete hypothesis; M=0 stops at
+        # the first complete hypothesis. Only set for the offline last-chunk
+        # pass (streaming beam overrides forward()).
+        _ed_M = int(os.environ.get("RESUME_ENDDETECT_M", "3"))
         ended_hyps = []
         for i in range(maxlen):
             logger.debug("position " + str(i))
             best = self.search(running_hyps, x, pre_x=pre_x)
+            # BatchBeamSearch.search() returns (hyps, bad_token_flag) tuple
+            if isinstance(best, tuple):
+                best = best[0]
             # post process of one iteration
             running_hyps = self.post_process(
                 i, maxlen, minlen, maxlenratio, best, ended_hyps
             )
             # end detection
-            if maxlenratio == 0.0 and end_detect([h.asdict() for h in ended_hyps], i):
-                logger.info(f"end detected at {i}")
+            if maxlenratio == 0.0 and end_detect(
+                [h.asdict() for h in ended_hyps], i + _ed_off, M=_ed_M
+            ):
+                logger.info(f"end detected at {i} (seq pos {i + _ed_off})")
                 break
             if len(running_hyps) == 0:
                 logger.info("no hypothesis. Finish decoding.")

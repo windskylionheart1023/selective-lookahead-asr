@@ -155,7 +155,7 @@ class BatchBeamSearchOnlineSim(BatchBeamSearch):
 
             while process_idx < maxlen:
                 logging.debug("position " + str(process_idx))
-                best = self.search(running_hyps, h)
+                best, _ = self.search(running_hyps, h)
 
                 if process_idx == maxlen - 1:
                     # end decoding

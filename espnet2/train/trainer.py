@@ -40,8 +40,14 @@ if torch.distributed.is_available():
     from torch.distributed import ReduceOp
 
 autocast_args = dict()
+_use_new_autocast_api = False
 if V(torch.__version__) >= V("1.6.0"):
-    from torch.cuda.amp import GradScaler, autocast
+    from torch.cuda.amp import GradScaler
+    if V(torch.__version__) >= V("2.0.0"):
+        from torch.amp import autocast as _autocast_impl
+        _use_new_autocast_api = True
+    else:
+        from torch.cuda.amp import autocast as _autocast_impl
 
     if (
         V(torch.__version__) >= V("1.10.0")
@@ -49,10 +55,23 @@ if V(torch.__version__) >= V("1.6.0"):
         and torch.cuda.is_bf16_supported()
     ):
         autocast_args = dict(dtype=torch.bfloat16)
+
+    @contextmanager
+    def autocast(enabled=True, **kwargs):
+        """Compatibility shim: torch>=2.0 torch.amp.autocast requires
+        device_type; older versions use torch.cuda.amp.autocast."""
+        if _use_new_autocast_api:
+            device_type = "cuda" if torch.cuda.is_available() else "cpu"
+            with _autocast_impl(device_type, enabled=enabled, **kwargs):
+                yield
+        else:
+            with _autocast_impl(enabled=enabled, **kwargs):
+                yield
 else:
     # Nothing to do if torch<1.6.0
     @contextmanager
-    def autocast(enabled=True):
+    def autocast(enabled=True, **kwargs):
+        """No-op stub: autocast is unavailable for torch<1.6.0."""
         yield
 
     GradScaler = None
@@ -857,7 +876,19 @@ class Trainer:
                 options.use_amp,
                 **autocast_args,
             ):
-                retval = model(**batch)
+                # Streaming decoders cache K/V for incremental inference;
+                # validation_mode disables that path during full-sequence
+                # validation forwards.
+                _has_dec_vm = hasattr(model, "decoder") and hasattr(
+                    model.decoder, "validation_mode"
+                )
+                if _has_dec_vm:
+                    model.decoder.validation_mode = True
+                try:
+                    retval = model(**batch)
+                finally:
+                    if _has_dec_vm:
+                        model.decoder.validation_mode = False
 
             if isinstance(retval, dict):
                 stats = retval["stats"]

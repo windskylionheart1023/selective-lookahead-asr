@@ -549,6 +549,195 @@ class CommonPreprocessor(AbsPreprocessor):
         return data
 
 
+class StreamingPreprocessor(CommonPreprocessor):
+    """Preprocessor that attaches per-token time alignments for streaming ASR.
+
+    Extends CommonPreprocessor by running on-the-fly CTC segmentation with a
+    pretrained offline ASR model during data loading, adding
+    "token_start_times" and "token_end_times" (seconds) to each example for
+    chunk-level alignment supervision in streaming training.
+    """
+
+    def __init__(
+        self,
+        train: bool,
+        use_lang_prompt: bool = False,
+        use_nlp_prompt: bool = False,
+        token_type: Optional[str] = None,
+        token_list: Union[Path, str, Iterable[str]] = None,
+        bpemodel: Union[Path, str, Iterable[str]] = None,
+        text_cleaner: Collection[str] = None,
+        g2p_type: Optional[str] = None,
+        unk_symbol: str = "<unk>",
+        space_symbol: str = "<space>",
+        non_linguistic_symbols: Union[Path, str, Iterable[str]] = None,
+        delimiter: Optional[str] = None,
+        force_single_channel: bool = False,
+        rir_scp: Optional[str] = None,
+        rir_apply_prob: float = 1.0,
+        noise_scp: Optional[str] = None,
+        noise_apply_prob: float = 1.0,
+        noise_db_range: str = "3_10",
+        short_noise_thres: float = 0.5,
+        aux_task_names: Collection[str] = None,
+        speech_volume_normalize: float = None,
+        speech_name: str = "speech",
+        text_name: str = "text",
+        fs: int = 0,
+        nonsplit_symbol: Iterable[str] = None,
+        data_aug_effects: List = None,
+        data_aug_num: List[int] = [1, 1],
+        data_aug_prob: float = 0.0,
+        # for padding of chunk iterator, working when > 0
+        min_sample_size: int = -1,
+        audio_pad_value: Union[float, int] = 0.0,
+        # only use for whisper
+        whisper_language: Optional[str] = None,
+        whisper_task: Optional[str] = None,
+        # only for time alignment in streaming setting
+        asr_train_config: Optional[Union[str, Path]] = None,
+        asr_model_file: Optional[Union[str, Path]] = None,
+    ):
+        """Initialize StreamingPreprocessor.
+
+        Accepts the same arguments as CommonPreprocessor, plus:
+
+        Args:
+            asr_train_config: Training config of the pretrained offline ASR
+                model used by the CTC segmentation aligner.
+            asr_model_file: Checkpoint of the pretrained offline ASR model
+                used by the CTC segmentation aligner.
+        """
+        super().__init__(
+            train=train,
+            use_lang_prompt=use_lang_prompt,
+            use_nlp_prompt=use_nlp_prompt,
+            token_type=token_type,
+            token_list=token_list,
+            bpemodel=bpemodel,
+            text_cleaner=text_cleaner,
+            g2p_type=g2p_type,
+            unk_symbol=unk_symbol,
+            space_symbol=space_symbol,
+            non_linguistic_symbols=non_linguistic_symbols,
+            delimiter=delimiter,
+            force_single_channel=force_single_channel,
+            rir_scp=rir_scp,
+            rir_apply_prob=rir_apply_prob,
+            noise_scp=noise_scp,
+            noise_apply_prob=noise_apply_prob,
+            noise_db_range=noise_db_range,
+            short_noise_thres=short_noise_thres,
+            aux_task_names=aux_task_names,
+            speech_volume_normalize=speech_volume_normalize,
+            speech_name=speech_name,
+            text_name=text_name,
+            fs=fs,
+            nonsplit_symbol=nonsplit_symbol,
+            data_aug_effects=data_aug_effects,
+            data_aug_num=data_aug_num,
+            data_aug_prob=data_aug_prob,
+            min_sample_size=min_sample_size,
+            audio_pad_value=audio_pad_value,
+            whisper_language=whisper_language,
+            whisper_task=whisper_task,
+        )
+        # Initialize ESPnet CTC segmenter
+        from espnet2.bin.asr_align import CTCSegmentation
+        self.aligner = CTCSegmentation(
+            asr_train_config=asr_train_config,
+            asr_model_file=asr_model_file,
+            fs=fs,
+            text_converter="classic",
+            time_stamps="auto",
+            kaldi_style_text=False,
+        )
+
+    def _text_process(
+        self, data: Dict[str, Union[str, np.ndarray]]
+    ) -> Dict[str, np.ndarray]:
+        # NOTE: mirrors CommonPreprocessor._text_process with a CTC
+        # segmentation block inserted after tokenization (the block needs the
+        # local "tokens" variable, which the parent method does not expose).
+        # Keep in sync with upstream changes to the parent method.
+        if self.text_name in data and self.tokenizer is not None:
+            text = data[self.text_name]
+            if isinstance(text, np.ndarray):
+                return data
+            text = self.text_cleaner(text)
+            tokens = self.tokenizer.text2tokens(text)
+            text_ints = self.token_id_converter.tokens2ids(tokens)
+            if len(text_ints) > 500:
+                logging.warning(
+                    "The length of the text output exceeds 500, "
+                    "which may cause OOM on the GPU."
+                    "Please ensure that the data processing is correct and verify it."
+                )
+            if "prompt" in data:
+                actual_token = (
+                    self.token_id_converter.tokenizer.tokenizer.convert_ids_to_tokens(
+                        text_ints
+                    )
+                )
+                if self.use_lang_prompt:
+                    if data["prompt"] == "<|nospeech|>":
+                        actual_token = [data["prompt"]]
+                    else:
+                        actual_token = data["prompt"].split() + actual_token[2:]
+                elif self.use_nlp_prompt:
+                    prompt_tokens = self.tokenizer.text2tokens(data["prompt"])
+                    actual_token = [actual_token[0]] + prompt_tokens + actual_token[2:]
+                else:
+                    if len(data["prompt"].split()) > 1:
+                        actual_token = (
+                            [actual_token[0]]
+                            + data["prompt"].split()
+                            + actual_token[2:]
+                        )
+                    else:
+                        actual_token[1] = data["prompt"]
+                text_ints = (
+                    self.token_id_converter.tokenizer.tokenizer.convert_tokens_to_ids(
+                        actual_token
+                    )
+                )
+            data[self.text_name] = np.array(text_ints, dtype=np.int64)
+
+            # Perform CTC segmentation for time alignment
+            speech = data[self.speech_name]
+
+            if speech is not None:
+                task = self.aligner(speech, tokens, fs=self.fs)
+                segments = task.segments
+                # Extract start and end times per token
+                starts = np.array([seg[0] for seg in segments], dtype=np.float32)
+                ends = np.array([seg[1] for seg in segments], dtype=np.float32)
+                data["token_start_times"] = starts
+                data["token_end_times"] = ends
+
+            if "prompt" in data:
+                whisper_tokenizer = self.token_id_converter.tokenizer.tokenizer
+                if len(data["prompt"].split()) > 1:
+                    data["prompt"] = np.array(
+                        whisper_tokenizer.convert_tokens_to_ids(data["prompt"].split()),
+                        dtype=np.int64,
+                    )
+                else:
+                    data["prompt"] = np.array(
+                        [whisper_tokenizer.convert_tokens_to_ids(data["prompt"])],
+                        dtype=np.int64,
+                    )
+        if self.aux_task_names is not None and self.tokenizer is not None:
+            for name in self.aux_task_names:
+                if name in data:
+                    text = data[name]
+                    text = self.text_cleaner(text)
+                    tokens = self.tokenizer.text2tokens(text)
+                    text_ints = self.token_id_converter.tokens2ids(tokens)
+                    data[name] = np.array(text_ints, dtype=np.int64)
+        return data
+
+
 class SLUPreprocessor(CommonPreprocessor):
     def __init__(
         self,

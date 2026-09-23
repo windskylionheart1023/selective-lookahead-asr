@@ -51,7 +51,17 @@ from espnet2.asr.encoder.transformer_encoder_multispkr import (
 from espnet2.asr.encoder.vgg_rnn_encoder import VGGRNNEncoder
 from espnet2.asr.encoder.wav2vec2_encoder import FairSeqWav2Vec2Encoder
 from espnet2.asr.encoder.whisper_encoder import OpenAIWhisperEncoder
-from espnet2.asr.espnet_model import ESPnetASRModel
+try:
+    from espnet2.asr.encoder.mamba_encoder import MambaEncoder
+    from espnet2.asr.encoder.hybrid_mamba_attention_encoder import (
+        HybridMambaAttentionEncoder,
+    )
+except (ImportError, RuntimeError):
+    # mamba_ssm/triton require a GPU driver even at import time; keep the
+    # mamba encoders optional so CPU-only training/inference still works.
+    MambaEncoder = None
+    HybridMambaAttentionEncoder = None
+from espnet2.asr_stream.espnet_model import ESPnetASRModel
 from espnet2.asr.frontend.abs_frontend import AbsFrontend
 from espnet2.asr.frontend.cnn import CNNFrontend
 from espnet2.asr.frontend.default import DefaultFrontend
@@ -87,6 +97,7 @@ from espnet2.train.preprocessor import (
     AbsPreprocessor,
     CommonPreprocessor,
     CommonPreprocessor_multi,
+    StreamingPreprocessor,
 )
 from espnet2.train.trainer import Trainer
 from espnet2.utils.get_default_kwargs import get_default_kwargs
@@ -168,6 +179,14 @@ encoder_choices = ClassChoices(
         avhubert=FairseqAVHubertEncoder,
         multiconv_conformer=MultiConvConformerEncoder,
         beats=BeatsEncoder,
+        **(
+            dict(
+                mamba=MambaEncoder,
+                hybrid_mamba_attention=HybridMambaAttentionEncoder,
+            )
+            if MambaEncoder is not None
+            else {}
+        ),
     ),
     type_check=AbsEncoder,
     default="rnn",
@@ -209,6 +228,7 @@ preprocessor_choices = ClassChoices(
     classes=dict(
         default=CommonPreprocessor,
         multi=CommonPreprocessor_multi,
+        streaming=StreamingPreprocessor,
     ),
     type_check=AbsPreprocessor,
     default="default",
@@ -503,6 +523,7 @@ class ASRTask(AbsTask):
 
         retval = ["text_spk{}".format(n) for n in range(2, MAX_REFERENCE_NUM + 1)]
         retval = retval + ["prompt"]
+        retval = retval + ["alignment"]
         retval = tuple(retval)
 
         logging.info(f"Optional Data Names: {retval }")

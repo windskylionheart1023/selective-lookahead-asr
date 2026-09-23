@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import copy
+import json
 import logging
 import sys
 from distutils.version import LooseVersion
@@ -481,6 +482,14 @@ class Speech2Text:
         self.beam_search = beam_search
         self.beam_search_transducer = beam_search_transducer
         self.hugging_face_model = hugging_face_model
+
+        # Per-utterance CTC log-prob buffer (numpy (T, V) when populated).
+        # Filled inside __call__ before beam search; consumed by the
+        # inference loop when --dump_ctc_logprobs_dir is set.
+        self._last_ctc_logprobs = None
+        # Set to True by inference() when --dump_ctc_logprobs_dir is given;
+        # skips the per-utterance capture (and its host copy) otherwise.
+        self.capture_ctc_logprobs = False
         self.hugging_face_linear_in = hugging_face_linear_in
         self.hugging_face_decoder_conf = hugging_face_decoder_conf
         self.maxlenratio = maxlenratio
@@ -526,6 +535,34 @@ class Speech2Text:
 
         # b. Forward Encoder
         enc, enc_olens = self.asr_model.encode(**batch)
+
+        # Chunked-mask encoders return (B, T, C, D) with a trivial C axis when
+        # num_right_chunks=0 (e.g. causal models); collapse it for the
+        # decoders/searches below, which expect (B, T, D).
+        if (
+            not isinstance(enc, tuple)
+            and enc.dim() == 4
+            and enc.size(2) == 1
+        ):
+            enc = enc[:, :, 0, :]
+
+        # Capture per-frame CTC log-probs immediately after the encoder runs
+        # (before beam search) so the dump survives any downstream failure.
+        # Single-speaker, non-tuple, non-Enh path only; the diagnostic dump
+        # is not meaningful for multi-spk or enh+ASR cases.
+        self._last_ctc_logprobs = None
+        if self.capture_ctc_logprobs:
+            try:
+                if (not self.multi_asr) and (not self.enh_s2t_task) and \
+                        (not isinstance(enc, tuple)) and getattr(self.asr_model, "ctc", None) is not None:
+                    with torch.no_grad():
+                        logits = self.asr_model.ctc.ctc_lo(enc[0])
+                        logp = torch.log_softmax(logits, dim=-1)
+                    self._last_ctc_logprobs = logp.detach().cpu().numpy()
+            except Exception as _e:
+                logger.warning(f"CTC log-prob capture failed: {_e}")
+                self._last_ctc_logprobs = None
+
         if self.multi_asr:
             enc = enc.unbind(dim=1)  # (batch, num_inf, ...) -> num_inf x [batch, ...]
         if self.enh_s2t_task or self.multi_asr:
@@ -669,6 +706,11 @@ class Speech2Text:
             # remove blank symbol id, which is assumed to be 0
             token_int = list(filter(lambda x: x != 0, token_int))
 
+            # remove last scores_list entry (corresponds to EOS)
+            if not self.asr_model.use_transducer_decoder:
+                if hyp.scores_list:
+                    hyp.scores_list.pop()
+
             # Change integer-ids to tokens
             token = self.converter.ids2tokens(token_int)
 
@@ -760,7 +802,14 @@ def inference(
     threshold_probability: float,
     max_seq_len: int,
     max_mask_parallel: int,
+    dump_ctc_logprobs_dir: Optional[str] = None,
 ):
+    """Run ASR decoding over a dataset and write n-best results.
+
+    Arguments mirror the command line options defined in get_parser().
+    If dump_ctc_logprobs_dir is set, per-frame CTC log-probabilities are
+    additionally saved to <dir>/<utt_key>.npy for every utterance.
+    """
     if batch_size > 1:
         raise NotImplementedError("batch decoding is not implemented")
     if word_lm_train_config is not None:
@@ -838,8 +887,18 @@ def inference(
         inference=True,
     )
 
+    # Prepare CTC log-prob dump directory if requested.
+    if dump_ctc_logprobs_dir is not None:
+        speech2text.capture_ctc_logprobs = True
+        Path(dump_ctc_logprobs_dir).mkdir(parents=True, exist_ok=True)
+        logger.info(
+            f"Per-frame CTC log-probs will be saved to {dump_ctc_logprobs_dir}/"
+            f"<utt_key>.npy"
+        )
+
     # 7 .Start for-loop
     # FIXME(kamo): The output format should be discussed about
+    scores_list_data = {n: [] for n in range(1, nbest + 1)}
     with DatadirWriter(output_dir) as writer:
         for keys, batch in loader:
             assert isinstance(batch, dict), type(batch)
@@ -861,6 +920,20 @@ def inference(
 
             # Only supporting batch_size==1
             key = keys[0]
+
+            # Per-frame CTC log-prob dump (one .npy per utterance, shape (T, V)).
+            if dump_ctc_logprobs_dir is not None:
+                logp = getattr(speech2text, "_last_ctc_logprobs", None)
+                if logp is not None:
+                    np.save(
+                        str(Path(dump_ctc_logprobs_dir) / f"{key}.npy"),
+                        logp,
+                    )
+                else:
+                    logger.warning(
+                        f"CTC log-probs unavailable for {key}; skipping dump."
+                    )
+
             if enh_s2t_task or multi_asr:
                 # Enh+ASR joint task
                 for spk, ret in enumerate(results, 1):
@@ -897,8 +970,24 @@ def inference(
                     ibest_writer["token_int"][key] = " ".join(map(str, token_int))
                     ibest_writer["score"][key] = str(hyp.score)
 
+                    # Per-token emission ENCODER-FRAME index (transducer
+                    # latency). timestamp is parallel to yseq with -1 for the
+                    # blank prefix, so [1:] aligns with token_int (emitted
+                    # non-blank tokens). Stored as a raw frame index; convert
+                    # to ms downstream using the model's frontend and encoder
+                    # subsampling factors.
+                    _ts = getattr(hyp, "timestamp", None)
+                    if _ts is not None:
+                        ibest_writer["frame_emit"][key] = " ".join(
+                            map(str, _ts[1:])
+                        )
+
                     if text is not None:
                         ibest_writer["text"][key] = text
+
+                    # Transducer Hypothesis has no scores_list (AED-only diagnostic)
+                    if hasattr(hyp, "scores_list"):
+                        scores_list_data[n].append((key, hyp.scores_list))
 
                 # Write intermediate predictions to
                 # encoder_interctc_layer<layer_idx>.txt
@@ -908,6 +997,12 @@ def inference(
                         ibest_writer[f"encoder_interctc_layer{idx}.txt"][key] = (
                             " ".join(text)
                         )
+
+    # Write scores_list.json for each n-best
+    for n in range(1, nbest + 1):
+        score_file_path = f"{output_dir}/{n}best_recog/scores_list.json"
+        with open(score_file_path, "w") as f:
+            json.dump(scores_list_data[n], f)
 
 
 def get_parser():
@@ -1167,6 +1262,14 @@ def get_parser():
         help="Maximum number of masks to predict in parallel."
         + "If you got OOM error, try to decrease this value."
         + "Default to -1, which means always predict all masks simultaneously.",
+    )
+    group.add_argument(
+        "--dump_ctc_logprobs_dir",
+        type=str,
+        default=None,
+        help="If set, write per-frame CTC log-probabilities for every "
+        "utterance to <dir>/<utt_key>.npy (shape (T, V), float32). "
+        "Used for distribution-divergence analysis (CTC-only diagnostic).",
     )
     return parser
 

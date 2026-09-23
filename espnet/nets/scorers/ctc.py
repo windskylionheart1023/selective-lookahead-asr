@@ -120,7 +120,7 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
                 state[0][2],
                 state[0][3],
             )
-            if state[0] is not None
+            if all(s is not None for s in state)
             else None
         )
         return self.impl(y, batch_state, ids)
